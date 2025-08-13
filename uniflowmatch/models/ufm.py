@@ -32,6 +32,8 @@ from uniflowmatch.models.base import (
 from uniflowmatch.models.unet_encoder import UNet
 from uniflowmatch.models.utils import get_meshgrid_torch
 
+from uniflowmatch.models.feature_cache import PreallocatedTensorLRU
+
 CLASSNAME_TO_ADAPTOR_CLASS = {
     "FlowWithConfidenceAdaptor": FlowWithConfidenceAdaptor,
     "FlowAdaptor": FlowAdaptor,
@@ -160,6 +162,8 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
             self.cnn_encoder: nn.Module = ResNet50(pretrained=True, freeze_bn=False)
             self.cnn_feat_proj: nn.Module = nn.Conv2d(1024, self.encoder.enc_embed_dim, kernel_size=1)
 
+        self.cached_features = PreallocatedTensorLRU(max_items=6, feature_shape=(self.encoder.enc_embed_dim, 320//16, 480//16), device="cpu", dtype=torch.float16)
+
         # initialize info-sharing module
         assert head_type != "linear", "Linear head is not supported, because it have major disadvantage to DPTs"
         self.head_type = head_type
@@ -189,6 +193,10 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
 
                 load_result = self.load_state_dict(model_state_dict, strict=False)
                 assert len(load_result.missing_keys) == 0, f"Missing keys: {load_result.missing_keys}"
+
+    def to(self, *args, **kwargs):
+        self.cached_features.to(*args, **kwargs)
+        super().to(*args, **kwargs)
 
     @classmethod
     def from_pretrained_ckpt(cls, pretrained_model_name_or_path, strict=True, **kw):
@@ -310,6 +318,82 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
             for name, configs in adaptors_kwargs.items()
         }
 
+    def _encode_and_cache_image_features(self, img: torch.Tensor, labels: List[str], data_norm_type: str):
+        """
+        A read-through cache for image features. This speeds up inference by reusing previous image-encoder computations. 
+        """
+
+        B, C, H, W = img.shape
+        patch_size = self.encoder.patch_size
+        Hp, Wp = H // patch_size, W // patch_size
+
+        outputs = torch.zeros((B, self.encoder.enc_embed_dim, Hp, Wp), dtype=torch.float16, device=img.device)
+
+        # copy the available features
+        remaining_indexes = []
+
+        for index, label in enumerate(labels):
+            if not (label in self.cached_features):
+                remaining_indexes.append(index)
+
+        # compute unique index of the unique label
+        unique_labels = list(set(labels[index] for index in remaining_indexes))
+
+        unique_indices = [
+            remaining_indexes[
+                [labels[i] for i in remaining_indexes].index(label)
+            ]
+            for label in unique_labels
+        ]
+
+        # compute the features for the remaining features
+        if unique_indices:
+            remaining_imgs = img[unique_indices]
+            encoder_input = ViTEncoderInput(image=remaining_imgs, data_norm_type=data_norm_type)
+            output = self.encoder(encoder_input)
+
+            if self.cnn_augment:
+                # Re-normalize input image to ImageNet
+                prior_mean, prior_std = (
+                    IMAGE_NORMALIZATION_DICT[data_norm_type].mean,
+                    IMAGE_NORMALIZATION_DICT[data_norm_type].std,
+                )
+                imgnet_mean, imgnet_std = (
+                    IMAGE_NORMALIZATION_DICT["dinov2"].mean,
+                    IMAGE_NORMALIZATION_DICT["dinov2"].std,
+                )
+
+                scale = (prior_std / imgnet_std).to(remaining_imgs.device)
+                offset = (imgnet_mean - prior_mean).to(remaining_imgs.device)
+
+                imgnet_normalized_cat_imgs = remaining_imgs * scale.view(1, 3, 1, 1) + offset.view(1, 3, 1, 1)
+
+                if self.encoder.patch_size == 14:
+                    # Interpolate images to be 16/14 larger so that the number of patches stays the same
+                    imgnet_normalized_cat_imgs = torch.nn.functional.interpolate(
+                        imgnet_normalized_cat_imgs,
+                        scale_factor=16 / 14,
+                        align_corners=False,
+                        mode="bicubic",
+                        antialias=True,
+                    )
+
+                cnn_feat = self.cnn_encoder(imgnet_normalized_cat_imgs)[16]
+                cnn_feat = self.cnn_feat_proj(cnn_feat)
+
+                output[-1].features += cnn_feat
+
+            # store the newly computed features
+            for i, index in enumerate(unique_indices):
+                self.cached_features.put(labels[index], output[-1].features[i])
+
+            # read-out all features from the cache
+            for index, label in enumerate(labels):
+                outputs[index] = self.cached_features.get(label)
+
+        return outputs
+    
+
     def _encode_image_pairs(self, img1, img2, data_norm_type):
         "Encode two different batches of images (each batch can have different image shape)"
         if img1.shape[-2:] == img2.shape[-2:]:
@@ -387,6 +471,83 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
 
         return feat1_list, feat2_list
 
+    def encode_images(self, view1, view2):
+        """
+        Forward interface of correspondence prediction networks.
+        """
+        # Encode the two images --> Each feat output: BCHW features (batch_size, feature_dim, feature_height, feature_width)
+        if "labels" in view1 and "labels" in view2:
+            # use label-based feature caching
+            all_images = torch.cat((view1["img"], view2["img"]), dim=0)
+            all_labels = view1["labels"] + view2["labels"]
+
+            all_feats = self._encode_and_cache_image_features(
+                img=all_images,
+                labels=all_labels,
+                data_norm_type=view1["data_norm_type"],
+            )
+
+            return all_feats.chunk(2, dim=0)
+        else:
+            # use existing symmetric-based inference
+            feat1_list, feat2_list = self._encode_symmetrized(view1, view2, view1["symmetrized"])
+
+            return feat1_list[-1], feat2_list[-1]
+
+    def encoder_feats_to_output(self, encoder_feat1: torch.Tensor, encoder_feat2: torch.Tensor):
+        """
+        Encoded features to final outputs.
+        """
+        
+        # Pass the features through the info_sharing
+        info_sharing_input = MultiViewTransformerInput(features=[encoder_feat1, encoder_feat2])
+
+        final_info_sharing_multi_view_feat, intermediate_info_sharing_multi_view_feat = self.info_sharing(
+            info_sharing_input
+        )
+
+        info_sharing_outputs = {
+            "1": [
+                encoder_feat1.float().contiguous(),
+                intermediate_info_sharing_multi_view_feat[0].features[0].float().contiguous(),
+                intermediate_info_sharing_multi_view_feat[1].features[0].float().contiguous(),
+                final_info_sharing_multi_view_feat.features[0].float().contiguous(),
+            ],
+            "2": [
+                encoder_feat2.float().contiguous(),
+                intermediate_info_sharing_multi_view_feat[0].features[1].float().contiguous(),
+                intermediate_info_sharing_multi_view_feat[1].features[1].float().contiguous(),
+                final_info_sharing_multi_view_feat.features[1].float().contiguous(),
+            ],
+        }
+
+        result = UFMOutputInterface()
+
+        # The prediction need precision, so we disable any autocasting here
+        with torch.autocast("cuda", torch.float32):
+            # run the collected info_sharing features through the prediction heads
+            B, _, Hp, Wp = encoder_feat1.shape
+            shape1 = (Hp * self.encoder.patch_size, Wp * self.encoder.patch_size)
+            head_output1 = self._downstream_head(1, info_sharing_outputs, shape1)
+
+            if "flow" in head_output1:
+                # output is flow only
+                result.flow = UFMFlowFieldOutput(flow_output=head_output1["flow"].value)
+
+            if "flow_cov" in head_output1:
+                result.flow.flow_covariance = head_output1["flow_cov"].covariance
+                result.flow.flow_covariance_inv = head_output1["flow_cov"].inv_covariance
+                result.flow.flow_covariance_log_det = head_output1["flow_cov"].log_det
+
+            if "non_occluded_mask" in head_output1:
+                result.covisibility = UFMMaskFieldOutput(
+                    mask=head_output1["non_occluded_mask"].mask,
+                    logits=head_output1["non_occluded_mask"].logits,
+                )
+
+        return result
+
+
     def forward(self, view1, view2) -> UFMOutputInterface:
         """
         Forward interface of correspondence prediction networks.
@@ -410,60 +571,8 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
             - [Optional] logits
         """
 
-        # Get input shapes
-        _, _, height1, width1 = view1["img"].shape
-        _, _, height2, width2 = view2["img"].shape
-        shape1 = (int(height1), int(width1))
-        shape2 = (int(height2), int(width2))
-
-        # Encode the two images --> Each feat output: BCHW features (batch_size, feature_dim, feature_height, feature_width)
-        feat1_list, feat2_list = self._encode_symmetrized(view1, view2, view1["symmetrized"])
-
-        # Pass the features through the info_sharing
-        info_sharing_input = MultiViewTransformerInput(features=[feat1_list[-1], feat2_list[-1]])
-
-        final_info_sharing_multi_view_feat, intermediate_info_sharing_multi_view_feat = self.info_sharing(
-            info_sharing_input
-        )
-
-        info_sharing_outputs = {
-            "1": [
-                feat1_list[-1].float().contiguous(),
-                intermediate_info_sharing_multi_view_feat[0].features[0].float().contiguous(),
-                intermediate_info_sharing_multi_view_feat[1].features[0].float().contiguous(),
-                final_info_sharing_multi_view_feat.features[0].float().contiguous(),
-            ],
-            "2": [
-                feat2_list[-1].float().contiguous(),
-                intermediate_info_sharing_multi_view_feat[0].features[1].float().contiguous(),
-                intermediate_info_sharing_multi_view_feat[1].features[1].float().contiguous(),
-                final_info_sharing_multi_view_feat.features[1].float().contiguous(),
-            ],
-        }
-
-        result = UFMOutputInterface()
-
-        # The prediction need precision, so we disable any autocasting here
-        with torch.autocast("cuda", torch.float32):
-            # run the collected info_sharing features through the prediction heads
-            head_output1 = self._downstream_head(1, info_sharing_outputs, shape1)
-
-            if "flow" in head_output1:
-                # output is flow only
-                result.flow = UFMFlowFieldOutput(flow_output=head_output1["flow"].value)
-
-            if "flow_cov" in head_output1:
-                result.flow.flow_covariance = head_output1["flow_cov"].covariance
-                result.flow.flow_covariance_inv = head_output1["flow_cov"].inv_covariance
-                result.flow.flow_covariance_log_det = head_output1["flow_cov"].log_det
-
-            if "non_occluded_mask" in head_output1:
-                result.covisibility = UFMMaskFieldOutput(
-                    mask=head_output1["non_occluded_mask"].mask,
-                    logits=head_output1["non_occluded_mask"].logits,
-                )
-
-        return result
+        feat1, feat2 = self.encode_images(view1, view2)
+        return self.encoder_feats_to_output(feat1, feat2)
 
     def _downstream_head(self, head_num, decout, img_shape):
         "Run the respective prediction heads"
@@ -1149,72 +1258,35 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
     import torch
+    from tqdm import tqdm
 
     from uniflowmatch.utils.geometry import get_meshgrid_torch
     from uniflowmatch.utils.viz import warp_image_with_flow
 
     USE_REFINEMENT_MODEL = False
 
-    # if USE_REFINEMENT_MODEL:
-    #     model = UniFlowMatchClassificationRefinement.from_pretrained("infinity1096/UFM-Refine")
-    # else:
-    model = UniFlowMatchConfidence.from_pretrained("infinity1096/UFM-Base-980")
+    model = UniFlowMatch.from_pretrained("infinity1096/UFM-Robotics-V0", token="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", inference_resolution=[(480, 320)])
+    model.to("cuda")
+    model.eval()
 
-    # model = UniFlowMatchConfidence.from_pretrained_ckpt("/home/inf/match_anything/checkpoints/uniflowmatch/nips_final/ufm_980_ep15_converted.ckpt")
-    # model.push_to_hub("infinity1096/UFM-Base-980")
+    img_L = torch.randn(2, 3, 320, 480).cuda()
+    img_R = torch.randn(2, 3, 320, 480).cuda()
 
-    # # === Load and Prepare Images ===
-    # source_path = "examples/image_pairs/fire_academy_0.png"
-    # target_path = "examples/image_pairs/fire_academy_1.png"
+    for t in tqdm(range(1000)):
+        views = [
+            {
+                "img": img_L,
+                "labels": [f"{t}_L", f"{t+1}_L"],
+                "data_norm_type": "radio",
+                # "symmetrized": False
+            },
+            {
+                "img": img_R,
+                "labels": [f"{t}_R", f"{t+1}_R"],
+                "data_norm_type": "radio",
+                # "symmetrized": False
+            }
+        ]
 
-    # source_image = cv2.imread(source_path)
-    # target_image = cv2.imread(target_path)
-
-    # source_image = cv2.cvtColor(source_image, cv2.COLOR_BGR2RGB)
-    # target_image = cv2.cvtColor(target_image, cv2.COLOR_BGR2RGB)
-
-    # # === Predict Correspondences ===
-    # result = model.predict_correspondences_batched(
-    #     source_image=torch.from_numpy(source_image),
-    #     target_image=torch.from_numpy(target_image),
-    # )
-
-    # flow_output = result.flow.flow_output[0].cpu().numpy()
-    # covisibility = result.covisibility.mask[0].cpu().numpy()
-
-    # # === Visualize Results ===
-    # fig, axs = plt.subplots(2, 3, figsize=(15, 5))
-
-    # axs[0, 0].imshow(source_image)
-    # axs[0, 0].set_title("Source Image")
-
-    # axs[0, 1].imshow(target_image)
-    # axs[0, 1].set_title("Target Image")
-
-    # # Warp the image using flow
-    # warped_image = warp_image_with_flow(source_image, None, target_image, flow_output.transpose(1, 2, 0))
-    # warped_image = covisibility[..., None] * warped_image + (1 - covisibility[..., None]) * 255 * np.ones_like(
-    #     warped_image
-    # )
-    # warped_image /= 255.0
-
-    # axs[0, 2].imshow(warped_image)
-    # axs[0, 2].set_title("Warped Image")
-
-    # # Flow visualization
-    # flow_vis_image = flow_vis.flow_to_color(flow_output.transpose(1, 2, 0))
-    # axs[1, 0].imshow(flow_vis_image)
-    # axs[1, 0].set_title("Flow Output (Valid at covisible region)")
-
-    # # Covisibility mask
-    # axs[1, 1].imshow(covisibility > 0.5, cmap="gray", vmin=0, vmax=1)
-    # axs[1, 1].set_title("Covisibility Mask (Thresholded by 0.5)")
-
-    # heatmap = axs[1, 2].imshow(covisibility, cmap="gray", vmin=0, vmax=1)
-    # axs[1, 2].set_title("Covisibility Mask")
-    # plt.colorbar(heatmap, ax=axs[1, 2])
-
-    # plt.tight_layout()
-    # plt.savefig("ufm_output.png")
-    # plt.show()
-    # print("Saved ufm_output.png")
+        with torch.inference_mode():
+            output = model(views[0], views[1])
