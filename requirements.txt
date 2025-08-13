@@ -1,0 +1,12 @@
+torch
+torchvision
+torchaudio
+numpy
+matplotlib
+opencv-python
+flow_vis
+huggingface_hub
+einops
+gradio
+uniception==0.1.3
+timm
