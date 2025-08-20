@@ -574,6 +574,38 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
         feat1, feat2 = self.encode_images(view1, view2)
         return self.encoder_feats_to_output(feat1, feat2)
 
+    def inference(input_A, input_B) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        MAC-VO inference interface.
+
+        Inputs:
+            - input_A: the first images
+            - input_B: the second images
+
+        Outputs:
+            - est_flow: the estimated flow
+            - est_cov: the estimated covariance
+        """
+
+        # FIXME: We make a assumption here that images are BCHW, normalized to [0, 1]
+        views = [
+            {
+                "img": input_A,
+                "data_norm_type": "dummy",
+                "symmetrized": False
+            },
+            {
+                "img": input_B,
+                "data_norm_type": "dummy",
+                "symmetrized": False
+            }
+        ]
+
+        with torch.inference_mode():
+            output = model(views[0], views[1])
+
+        return output.flow.flow_output, output.flow.flow_covariance[..., :2]
+
     def _downstream_head(self, head_num, decout, img_shape):
         "Run the respective prediction heads"
         # if self.info_sharing_and_head_structure == "dual+single":
@@ -1072,38 +1104,6 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
         )
 
         return result
-
-    def inference(input_A, input_B) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        MAC-VO inference interface.
-
-        Inputs:
-            - input_A: the first images
-            - input_B: the second images
-
-        Outputs:
-            - est_flow: the estimated flow
-            - est_cov: the estimated covariance
-        """
-
-        # FIXME: We make a assumption here that images are BCHW, normalized to [0, 1]
-        views = [
-            {
-                "img": input_A,
-                "data_norm_type": "dummy",
-                "symmetrized": False
-            },
-            {
-                "img": input_B,
-                "data_norm_type": "dummy",
-                "symmetrized": False
-            }
-        ]
-
-        with torch.inference_mode():
-            output = model(views[0], views[1])
-
-        return output.flow.flow_output, output.flow.flow_covariance[..., :2]
 
 
     # @torch.compile()
