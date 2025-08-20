@@ -574,7 +574,7 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
         feat1, feat2 = self.encode_images(view1, view2)
         return self.encoder_feats_to_output(feat1, feat2)
 
-    def inference(input_A, input_B) -> Tuple[torch.Tensor, torch.Tensor]:
+    def inference(self, input_A, input_B) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         MAC-VO inference interface.
 
