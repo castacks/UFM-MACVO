@@ -605,7 +605,7 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
             with torch.autocast("cuda", enabled=True, dtype=torch.float16):
                 output = self(views[0], views[1])
 
-        return output.flow.flow_output, output.flow.flow_covariance[..., :2]
+        return output.flow.flow_output, output.flow.flow_covariance[:, :2, ...]
 
     def _downstream_head(self, head_num, decout, img_shape):
         "Run the respective prediction heads"
