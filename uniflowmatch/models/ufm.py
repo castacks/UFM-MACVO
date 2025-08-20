@@ -590,13 +590,13 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
         # FIXME: We make a assumption here that images are BCHW, normalized to [0, 1]
         views = [
             {
-                "img": input_A,
-                "data_norm_type": "dummy",
+                "img": input_A * 2 - 1,
+                "data_norm_type": "radio",
                 "symmetrized": False
             },
             {
-                "img": input_B,
-                "data_norm_type": "dummy",
+                "img": input_B * 2 - 1,
+                "data_norm_type": "radio",
                 "symmetrized": False
             }
         ]
