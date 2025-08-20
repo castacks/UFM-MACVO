@@ -602,7 +602,8 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
         ]
 
         with torch.inference_mode():
-            output = model(views[0], views[1])
+            with torch.autocast("cuda", enabled=True, dtype=torch.float16):
+                output = self(views[0], views[1])
 
         return output.flow.flow_output, output.flow.flow_covariance[..., :2]
 
