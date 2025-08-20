@@ -1073,6 +1073,39 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
 
         return result
 
+    def inference(input_A, input_B) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        MAC-VO inference interface.
+
+        Inputs:
+            - input_A: the first images
+            - input_B: the second images
+
+        Outputs:
+            - est_flow: the estimated flow
+            - est_cov: the estimated covariance
+        """
+
+        # FIXME: We make a assumption here that images are BCHW, normalized to [0, 1]
+        views = [
+            {
+                "img": input_A,
+                "data_norm_type": "dummy",
+                "symmetrized": False
+            },
+            {
+                "img": input_B,
+                "data_norm_type": "dummy",
+                "symmetrized": False
+            }
+        ]
+
+        with torch.inference_mode():
+            output = model(views[0], views[1])
+
+        return output.flow.flow_output, output.flow.flow_covariance[..., :2]
+
+
     # @torch.compile()
     def classification_refinement(self, flow_prediction, classification_features) -> Dict[str, Any]:
         """
