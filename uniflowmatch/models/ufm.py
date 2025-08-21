@@ -1,6 +1,7 @@
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+from dataclasses import dataclass
 import torch
 from huggingface_hub import PyTorchModelHubMixin
 from torch import nn
@@ -98,7 +99,7 @@ def modify_state_dict(original_state_dict, mappings):
 
     return new_state_dict
 
-
+@dataclass
 class CachedEncoderFeatures:
     time_ns: int
     img_L_ViT_features: torch.Tensor
@@ -324,6 +325,7 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
     def _encode_images_with_vit(self, img: torch.Tensor, data_norm_type: str):
         encoder_input = ViTEncoderInput(image=img, data_norm_type=data_norm_type)
         output = self.encoder(encoder_input)
+
         return [x.features for x in output]
 
 
@@ -634,7 +636,7 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
                 frame_t2_imgR = (frame_t2_imgR - imgmean) / imgstd
 
                 if (self.feature_cache is not None) and self.feature_cache.time_ns == frame_t1_ns:
-                    # cache hit, reuse 2/4 of encoder features.
+                    # cache hit, reuse 1/3 of encoder features.
                     t1_imgL_feat = self.feature_cache.img_L_ViT_features
                     t1_imgL_UNet_feat = self.feature_cache.img_L_UNet_features
 
@@ -642,7 +644,7 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
                         frame_t2_imgL, frame_t2_imgR, t1_imgL_feat, t1_imgL_UNet_feat
                     )
                 else:
-                    # cache miss, re-compute all 4 encoder features. 
+                    # cache miss, re-compute all 3 encoder features. 
                     t2_imgL_feat, t2_imgL_UNet_feat, flow_pred, cov_pred = self.inference_without_cache(
                         frame_t1_imgL, frame_t2_imgL, frame_t2_imgR
                     )
@@ -1171,21 +1173,21 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
         """
         Run inference without using cached features.
         """
-        cat_images = torch.cat([frame_t2_imgL, frame_t2_imgR], dim=0)
+        cat_images = torch.cat([frame_t2_imgR, frame_t2_imgL], dim=0)
 
         all_vit_feats = self._encode_images_with_vit(
             img=cat_images,
             data_norm_type="dinov2" # WARNING: Hard coded DINOv2 data norm type
         )
 
-        refinement_mlp_feats, final_feats = [x[0] for x in all_vit_feats], [x[1] for x in all_vit_feats]
+        refinement_mlp_feats, final_feats = all_vit_feats
 
         # Run the UNet features
         unet_features = self.unet_feature(cat_images)
-
-        ordered_mlp_feats = [refinement_mlp_feats, torch.cat([t1_imgL_feat[0], refinement_mlp_feats[0]], dim=0)] # t2L, t2R; t1L, t2L
-        ordered_final_feats = [final_feats, torch.cat([t1_imgL_feat[1], final_feats[0]], dim=0)]
-        ordered_unet_feats = [unet_features, torch.cat([t1_imgL_UNet_feat, unet_features[0]], dim=0)]
+        
+        ordered_mlp_feats = [torch.cat([refinement_mlp_feats[1:2], t1_imgL_feat[0]], dim=0), refinement_mlp_feats] # t2L, t1L compare to t2R, t2L
+        ordered_final_feats = [torch.cat([final_feats[1:2], t1_imgL_feat[1]], dim=0), final_feats]
+        ordered_unet_feats = [torch.cat([unet_features[1:2], t1_imgL_UNet_feat], dim=0), unet_features]
 
         return self.inference_with_encoded_feats(
             ordered_mlp_feats=ordered_mlp_feats,
@@ -1197,19 +1199,20 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
         """
         Run inference without using cached features.
         """
-        cat_images = torch.cat([frame_t1_imgL, frame_t2_imgL, frame_t2_imgR], dim=0)
+
+        cat_images = torch.cat([frame_t2_imgR, frame_t2_imgL, frame_t1_imgL], dim=0)
 
         all_vit_feats = self._encode_images_with_vit(
             img=cat_images,
             data_norm_type="dinov2" # WARNING: Hard coded DINOv2 data norm type
         )
 
-        refinement_mlp_feats, final_feats = [x[0] for x in all_vit_feats], [x[1] for x in all_vit_feats]
+        refinement_mlp_feats, final_feats = all_vit_feats
 
         # Run the UNet features
         unet_features = self.unet_feature(cat_images)
-
-        ordered_mlp_feats = [refinement_mlp_feats[1:], refinement_mlp_feats[:2]] # t2L, t2R; t1L, t2L
+        
+        ordered_mlp_feats = [refinement_mlp_feats[1:], refinement_mlp_feats[:2]] # t2L, t1L compare to t2R, t2L
         ordered_final_feats = [final_feats[1:], final_feats[:2]]
         ordered_unet_feats = [unet_features[1:], unet_features[:2]]
 
@@ -1223,8 +1226,8 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
 
         # Run info-sharing (t2L - t1L; t2R - t2L)
         info_sharing_input = MultiViewTransformerInput(features=[
-            ordered_final_feats[0], # t2L, t2R
-            ordered_final_feats[1], # t1L, t2L
+            ordered_final_feats[0], # t2L, t1L
+            ordered_final_feats[1], # t2R, t2L
         ])
 
         final_info_sharing_multi_view_feat, intermediate_info_sharing_multi_view_feat = self.info_sharing(
@@ -1250,28 +1253,39 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
         result = UFMOutputInterface()
         # The prediction need precision, so we disable any autocasting here
         with torch.autocast("cuda", torch.float32):
+            shape1 = [ordered_final_feats[0].shape[-2] * 14, ordered_final_feats[0].shape[-1] * 14]
+
             # run the collected info_sharing features through the prediction heads
-            B, _, Hp, Wp = ordered_final_feats[0].shape
-            shape1 = (Hp * self.encoder.patch_size, Wp * self.encoder.patch_size)
             head_output1 = self._downstream_head(1, info_sharing_outputs, shape1)
             flow_prediction = head_output1["flow"].value
 
-            if "flow" in head_output1:
-                # output is flow only
-                result.flow = UFMFlowFieldOutput(flow_output=head_output1["flow"].value)
+            result.flow = UFMFlowFieldOutput(
+                flow_output=flow_prediction,
+            )
 
-            if "flow_cov" in head_output1:
-                result.flow.flow_covariance = head_output1["flow_cov"].covariance
-                result.flow.flow_covariance_inv = head_output1["flow_cov"].inv_covariance
-                result.flow.flow_covariance_log_det = head_output1["flow_cov"].log_det
-
-            if "non_occluded_mask" in head_output1:
-                result.covisibility = UFMMaskFieldOutput(
-                    mask=head_output1["non_occluded_mask"].mask,
-                    logits=head_output1["non_occluded_mask"].logits,
+            if hasattr(self, "uncertainty_head"):
+                # run the uncertainty head
+                head_output_uncertainty = self._downstream_head(
+                    "uncertainty",
+                    info_sharing_outputs,
+                    shape1,
                 )
 
-        # compute refinement features ([1:] = t2L, t2R; [:2] = t1L, t2L)
+                if "flow_cov" in head_output_uncertainty:
+                    result.flow.flow_covariance = head_output_uncertainty["flow_cov"].covariance
+                    result.flow.flow_covariance_inv = head_output_uncertainty["flow_cov"].inv_covariance
+                    result.flow.flow_covariance_log_det = head_output_uncertainty["flow_cov"].log_det
+
+                if "keypoint_confidence" in head_output_uncertainty:
+                    result.keypoint_confidence = head_output_uncertainty["keypoint_confidence"].value.squeeze(1)
+
+                if "non_occluded_mask" in head_output_uncertainty:
+                    result.covisibility = UFMMaskFieldOutput(
+                        mask=head_output_uncertainty["non_occluded_mask"].mask,
+                        logits=head_output_uncertainty["non_occluded_mask"].logits,
+                    )
+
+        # compute refinement features
         classification_feat_1 = torch.cat(
             [ordered_mlp_feats[0].float().contiguous(), info_sharing_outputs["1"][-1]], dim=1
         )
@@ -1286,9 +1300,12 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
         classification_features = self.classification_head(classification_input).decoded_channels
 
 
-        combined_features = classification_features * torch.tanh(
-            torch.cat([ordered_unet_feats[0], ordered_unet_feats[1]], dim=0)
+        combined_features = torch.cat(
+            [classification_features, torch.cat([ordered_unet_feats[0], ordered_unet_feats[1]], dim=0)], dim=1
         )
+
+        combined_features = self.conv1(combined_features)
+        combined_features = nn.functional.relu(combined_features)
         classification_features = self.conv2(combined_features)
 
         # apply classification refinement
@@ -1301,11 +1318,11 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
 
         ### post-processing for MAC-VO output
         t2_imgL_feat = [
-            ordered_mlp_feats[1][0],    # t2L for first item in encoder output list
-            ordered_final_feats[1][0],  # t2L for last item in encoder output list
+            ordered_mlp_feats[0][0:1],    # t2L for first item in encoder output list
+            ordered_final_feats[0][0:1],  # t2L for last item in encoder output list
         ]
 
-        t2_imgL_UNet_feat = ordered_unet_feats[1][0]  # t2L UNet feature
+        t2_imgL_UNet_feat = ordered_unet_feats[0][0:1]  # t2L UNet feature
 
         return t2_imgL_feat, t2_imgL_UNet_feat, result.flow.flow_output, 1.0 / (1e-2 + result.covisibility.mask[:, :1, ...].repeat(1, 2, 1, 1))
 
