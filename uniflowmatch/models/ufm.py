@@ -99,6 +99,11 @@ def modify_state_dict(original_state_dict, mappings):
     return new_state_dict
 
 
+class CachedEncoderFeatures:
+    time_ns: int
+    img_L_ViT_features: torch.Tensor
+    img_L_UNet_features: torch.Tensor
+
 class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
     """
     UniFlowMatch model.
@@ -162,8 +167,6 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
             self.cnn_encoder: nn.Module = ResNet50(pretrained=True, freeze_bn=False)
             self.cnn_feat_proj: nn.Module = nn.Conv2d(1024, self.encoder.enc_embed_dim, kernel_size=1)
 
-        self.cached_features = PreallocatedTensorLRU(max_items=6, feature_shape=(self.encoder.enc_embed_dim, 320//16, 480//16), device="cpu", dtype=torch.float16)
-
         # initialize info-sharing module
         assert head_type != "linear", "Linear head is not supported, because it have major disadvantage to DPTs"
         self.head_type = head_type
@@ -194,9 +197,9 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
                 load_result = self.load_state_dict(model_state_dict, strict=False)
                 assert len(load_result.missing_keys) == 0, f"Missing keys: {load_result.missing_keys}"
 
-    def to(self, *args, **kwargs):
-        self.cached_features.to(*args, **kwargs)
-        super().to(*args, **kwargs)
+        # MAC-VO special improvement
+        self.feature_cache: Optional[CachedEncoderFeatures] = None
+
 
     @classmethod
     def from_pretrained_ckpt(cls, pretrained_model_name_or_path, strict=True, **kw):
@@ -317,6 +320,12 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
             name: CLASSNAME_TO_ADAPTOR_CLASS[configs["class"]](**configs["kwargs"])
             for name, configs in adaptors_kwargs.items()
         }
+
+    def _encode_images_with_vit(self, img: torch.Tensor, data_norm_type: str):
+        encoder_input = ViTEncoderInput(image=img, data_norm_type=data_norm_type)
+        output = self.encoder(encoder_input)
+        return [x.features for x in output]
+
 
     def _encode_and_cache_image_features(self, img: torch.Tensor, labels: List[str], data_norm_type: str):
         """
@@ -477,17 +486,7 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
         """
         # Encode the two images --> Each feat output: BCHW features (batch_size, feature_dim, feature_height, feature_width)
         if "labels" in view1 and "labels" in view2:
-            # use label-based feature caching
-            all_images = torch.cat((view1["img"], view2["img"]), dim=0)
-            all_labels = view1["labels"] + view2["labels"]
-
-            all_feats = self._encode_and_cache_image_features(
-                img=all_images,
-                labels=all_labels,
-                data_norm_type=view1["data_norm_type"],
-            )
-
-            return all_feats.chunk(2, dim=0)
+            raise NotImplementedError("Label-based feature caching is not implemented.")
         else:
             # use existing symmetric-based inference
             feat1_list, feat2_list = self._encode_symmetrized(view1, view2, view1["symmetrized"])
@@ -588,15 +587,19 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
         """
 
         # FIXME: We make a assumption here that images are BCHW, normalized to [0, 1]
+        imgmean = IMAGE_NORMALIZATION_DICT["dinov2"].mean.view(1, 3, 1, 1).to(input_A.device)
+        imgstd = IMAGE_NORMALIZATION_DICT["dinov2"].std.view(1, 3, 1, 1).to(input_A.device)
+
+
         views = [
             {
-                "img": input_A * 2 - 1,
-                "data_norm_type": "radio",
+                "img": (input_A - imgmean) / imgstd,
+                "data_norm_type": "dinov2",
                 "symmetrized": False
             },
             {
-                "img": input_B * 2 - 1,
-                "data_norm_type": "radio",
+                "img": (input_B - imgmean) / imgstd,
+                "data_norm_type": "dinov2",
                 "symmetrized": False
             }
         ]
@@ -605,7 +608,62 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
             with torch.autocast("cuda", enabled=True, dtype=torch.float16):
                 output = self(views[0], views[1])
 
-        return output.flow.flow_output, output.flow.flow_covariance[:, :2, ...]
+        return output.flow.flow_output, 1.0 / (1e-2 + output.covisibility.mask[:, :1, ...].repeat(1, 2, 1, 1))
+
+    def inference_MACVO_pair(
+            self, 
+            frame_t1_imgL : torch.Tensor, 
+            frame_t2_imgL : torch.Tensor, 
+            frame_t2_imgR : torch.Tensor, 
+            frame_t1_ns: int, 
+            frame_t2_ns: int
+        ):
+        """
+        Interface for MAC-VO's pair data input. Will use time_ns as the key for caching encoder features for frames.
+        """
+
+        with torch.inference_mode():
+            with torch.autocast("cuda", enabled=True, dtype=torch.float16):
+
+                # normalize the images
+                imgmean = IMAGE_NORMALIZATION_DICT["dinov2"].mean.view(1, 3, 1, 1).to(frame_t1_imgL.device)
+                imgstd = IMAGE_NORMALIZATION_DICT["dinov2"].std.view(1, 3, 1, 1).to(frame_t1_imgL.device)
+
+                frame_t1_imgL = (frame_t1_imgL - imgmean) / imgstd
+                frame_t2_imgL = (frame_t2_imgL - imgmean) / imgstd
+                frame_t2_imgR = (frame_t2_imgR - imgmean) / imgstd
+
+                if (self.feature_cache is not None) and self.feature_cache.time_ns == frame_t1_ns:
+                    # cache hit, reuse 2/4 of encoder features.
+                    t1_imgL_feat = self.feature_cache.img_L_ViT_features
+                    t1_imgL_UNet_feat = self.feature_cache.img_L_UNet_features
+
+                    t2_imgL_feat, t2_imgL_UNet_feat, flow_pred, cov_pred = self.inference_with_cached_features(
+                        frame_t2_imgL, frame_t2_imgR, t1_imgL_feat, t1_imgL_UNet_feat
+                    )
+                else:
+                    # cache miss, re-compute all 4 encoder features. 
+                    t2_imgL_feat, t2_imgL_UNet_feat, flow_pred, cov_pred = self.inference_without_cache(
+                        frame_t1_imgL, frame_t2_imgL, frame_t2_imgR
+                    )
+
+                # store the features in the cache
+                self.feature_cache = CachedEncoderFeatures(
+                    time_ns=frame_t2_ns,
+                    img_L_ViT_features=t2_imgL_feat,
+                    img_L_UNet_features=t2_imgL_UNet_feat,
+                )
+        
+        return flow_pred, cov_pred
+    
+    def inference_with_cached_features(self, frame_t2_imgL, frame_t2_imgR, t1_imgL_feat, t1_imgL_UNet_feat):
+        raise NotImplementedError("inference_with_cached_features is not implemented yet.")
+
+    def inference_without_cache(self, frame_t1_imgL, frame_t2_imgL, frame_t2_imgR):
+        """
+        Run inference without using cached features.
+        """
+        raise NotImplementedError("inference_without_cache is not implemented yet.")
 
     def _downstream_head(self, head_num, decout, img_shape):
         "Run the respective prediction heads"
@@ -1106,6 +1164,150 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
 
         return result
 
+    def _encode_images_with_UNet(self, img: torch.Tensor):
+        return self.unet_feature(img)
+
+    def inference_with_cached_features(self, frame_t2_imgL, frame_t2_imgR, t1_imgL_feat, t1_imgL_UNet_feat):
+        """
+        Run inference without using cached features.
+        """
+        cat_images = torch.cat([frame_t2_imgL, frame_t2_imgR], dim=0)
+
+        all_vit_feats = self._encode_images_with_vit(
+            img=cat_images,
+            data_norm_type="dinov2" # WARNING: Hard coded DINOv2 data norm type
+        )
+
+        refinement_mlp_feats, final_feats = [x[0] for x in all_vit_feats], [x[1] for x in all_vit_feats]
+
+        # Run the UNet features
+        unet_features = self.unet_feature(cat_images)
+
+        ordered_mlp_feats = [refinement_mlp_feats, torch.cat([t1_imgL_feat[0], refinement_mlp_feats[0]], dim=0)] # t2L, t2R; t1L, t2L
+        ordered_final_feats = [final_feats, torch.cat([t1_imgL_feat[1], final_feats[0]], dim=0)]
+        ordered_unet_feats = [unet_features, torch.cat([t1_imgL_UNet_feat, unet_features[0]], dim=0)]
+
+        return self.inference_with_encoded_feats(
+            ordered_mlp_feats=ordered_mlp_feats,
+            ordered_final_feats=ordered_final_feats,
+            ordered_unet_feats=ordered_unet_feats
+        )
+
+    def inference_without_cache(self, frame_t1_imgL, frame_t2_imgL, frame_t2_imgR):
+        """
+        Run inference without using cached features.
+        """
+        cat_images = torch.cat([frame_t1_imgL, frame_t2_imgL, frame_t2_imgR], dim=0)
+
+        all_vit_feats = self._encode_images_with_vit(
+            img=cat_images,
+            data_norm_type="dinov2" # WARNING: Hard coded DINOv2 data norm type
+        )
+
+        refinement_mlp_feats, final_feats = [x[0] for x in all_vit_feats], [x[1] for x in all_vit_feats]
+
+        # Run the UNet features
+        unet_features = self.unet_feature(cat_images)
+
+        ordered_mlp_feats = [refinement_mlp_feats[1:], refinement_mlp_feats[:2]] # t2L, t2R; t1L, t2L
+        ordered_final_feats = [final_feats[1:], final_feats[:2]]
+        ordered_unet_feats = [unet_features[1:], unet_features[:2]]
+
+        return self.inference_with_encoded_feats(
+            ordered_mlp_feats=ordered_mlp_feats,
+            ordered_final_feats=ordered_final_feats,
+            ordered_unet_feats=ordered_unet_feats
+        )
+
+    def inference_with_encoded_feats(self, ordered_mlp_feats, ordered_final_feats, ordered_unet_feats):
+
+        # Run info-sharing (t2L - t1L; t2R - t2L)
+        info_sharing_input = MultiViewTransformerInput(features=[
+            ordered_final_feats[0], # t2L, t2R
+            ordered_final_feats[1], # t1L, t2L
+        ])
+
+        final_info_sharing_multi_view_feat, intermediate_info_sharing_multi_view_feat = self.info_sharing(
+            info_sharing_input
+        )
+
+        # Run DPT Heads
+        info_sharing_outputs = {
+            "1": [
+                ordered_final_feats[0].float().contiguous(),
+                intermediate_info_sharing_multi_view_feat[0].features[0].float().contiguous(),
+                intermediate_info_sharing_multi_view_feat[1].features[0].float().contiguous(),
+                final_info_sharing_multi_view_feat.features[0].float().contiguous(),
+            ],
+            "2": [
+                ordered_final_feats[1].float().contiguous(),
+                intermediate_info_sharing_multi_view_feat[0].features[1].float().contiguous(),
+                intermediate_info_sharing_multi_view_feat[1].features[1].float().contiguous(),
+                final_info_sharing_multi_view_feat.features[1].float().contiguous(),
+            ],
+        }
+
+        result = UFMOutputInterface()
+        # The prediction need precision, so we disable any autocasting here
+        with torch.autocast("cuda", torch.float32):
+            # run the collected info_sharing features through the prediction heads
+            B, _, Hp, Wp = ordered_final_feats[0].shape
+            shape1 = (Hp * self.encoder.patch_size, Wp * self.encoder.patch_size)
+            head_output1 = self._downstream_head(1, info_sharing_outputs, shape1)
+            flow_prediction = head_output1["flow"].value
+
+            if "flow" in head_output1:
+                # output is flow only
+                result.flow = UFMFlowFieldOutput(flow_output=head_output1["flow"].value)
+
+            if "flow_cov" in head_output1:
+                result.flow.flow_covariance = head_output1["flow_cov"].covariance
+                result.flow.flow_covariance_inv = head_output1["flow_cov"].inv_covariance
+                result.flow.flow_covariance_log_det = head_output1["flow_cov"].log_det
+
+            if "non_occluded_mask" in head_output1:
+                result.covisibility = UFMMaskFieldOutput(
+                    mask=head_output1["non_occluded_mask"].mask,
+                    logits=head_output1["non_occluded_mask"].logits,
+                )
+
+        # compute refinement features ([1:] = t2L, t2R; [:2] = t1L, t2L)
+        classification_feat_1 = torch.cat(
+            [ordered_mlp_feats[0].float().contiguous(), info_sharing_outputs["1"][-1]], dim=1
+        )
+        classification_feat_2 = torch.cat(
+            [ordered_mlp_feats[1].float().contiguous(), info_sharing_outputs["2"][-1]], dim=1
+        )
+
+        classification_input = PredictionHeadInput(
+            torch.cat([classification_feat_1, classification_feat_2], dim=0)
+        )
+
+        classification_features = self.classification_head(classification_input).decoded_channels
+
+
+        combined_features = classification_features * torch.tanh(
+            torch.cat([ordered_unet_feats[0], ordered_unet_feats[1]], dim=0)
+        )
+        classification_features = self.conv2(combined_features)
+
+        # apply classification refinement
+        residual, log_softmax_attention = self.classification_refinement(
+            flow_prediction, classification_features
+        )
+        del log_softmax_attention
+
+        result.flow.flow_output = flow_prediction + residual
+
+        ### post-processing for MAC-VO output
+        t2_imgL_feat = [
+            ordered_mlp_feats[1][0],    # t2L for first item in encoder output list
+            ordered_final_feats[1][0],  # t2L for last item in encoder output list
+        ]
+
+        t2_imgL_UNet_feat = ordered_unet_feats[1][0]  # t2L UNet feature
+
+        return t2_imgL_feat, t2_imgL_UNet_feat, result.flow.flow_output, 1.0 / (1e-2 + result.covisibility.mask[:, :1, ...].repeat(1, 2, 1, 1))
 
     # @torch.compile()
     def classification_refinement(self, flow_prediction, classification_features) -> Dict[str, Any]:
