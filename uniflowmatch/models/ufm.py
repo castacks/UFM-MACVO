@@ -103,7 +103,7 @@ def get_engine(onnx_file_path, engine_file_path="", force_rebuild=False, trt_low
             # ]
 
             layer_type_list = [
-                trt.LayerType.CONVOLUTION,
+                # trt.LayerType.CONVOLUTION,
                 trt.LayerType.GRID_SAMPLE,
                 trt.LayerType.NMS,
                 trt.LayerType.ACTIVATION,
@@ -111,9 +111,9 @@ def get_engine(onnx_file_path, engine_file_path="", force_rebuild=False, trt_low
                 trt.LayerType.LRN,
                 trt.LayerType.SCALE,
                 trt.LayerType.SOFTMAX,
-                trt.LayerType.DECONVOLUTION,
+                # trt.LayerType.DECONVOLUTION,
                 trt.LayerType.CONCATENATION,
-                trt.LayerType.ELEMENTWISE,
+                # trt.LayerType.ELEMENTWISE,
                 trt.LayerType.PLUGIN,
                 trt.LayerType.UNARY,
                 trt.LayerType.PADDING,
