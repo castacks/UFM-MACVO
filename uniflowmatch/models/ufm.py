@@ -33,8 +33,6 @@ from uniflowmatch.models.base import (
 from uniflowmatch.models.unet_encoder import UNet
 from uniflowmatch.models.utils import get_meshgrid_torch
 
-from uniflowmatch.models.feature_cache import PreallocatedTensorLRU
-
 CLASSNAME_TO_ADAPTOR_CLASS = {
     "FlowWithConfidenceAdaptor": FlowWithConfidenceAdaptor,
     "FlowAdaptor": FlowAdaptor,
@@ -43,6 +41,176 @@ CLASSNAME_TO_ADAPTOR_CLASS = {
     "ConfidenceAdaptor": ConfidenceAdaptor,
 }
 
+import tensorrt as trt
+
+TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+
+def get_engine(onnx_file_path, engine_file_path="", force_rebuild=False, trt_low_precision_override=None):
+    """Attempts to load a serialized engine if available, otherwise builds a new TensorRT engine and saves it."""
+
+    def build_engine(trt_low_precision_override=None):
+        """Takes an ONNX file and creates a TensorRT engine to run inference with"""
+        with trt.Builder(TRT_LOGGER) as builder, builder.create_network(
+            0
+        ) as network, builder.create_builder_config() as config, trt.OnnxParser(
+            network, TRT_LOGGER
+        ) as parser, trt.Runtime(
+            TRT_LOGGER
+        ) as runtime:
+                
+            # Set the builder configurations
+            config.set_memory_pool_limit(
+                trt.MemoryPoolType.WORKSPACE, 1 << 34
+            )  # 16 GB
+
+            # set precision to FP16 to enable FlashAttention
+            config.set_flag(trt.BuilderFlag.FP16)
+            config.default_device_type = trt.DeviceType.GPU
+            config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+            
+            # Parse model file
+            if not os.path.exists(onnx_file_path):
+                print(
+                    "ONNX file {} not found, please run yolov3_to_onnx.py first to generate it.".format(
+                        onnx_file_path
+                    )
+                )
+                return None
+            print("Loading ONNX file from path {}...".format(onnx_file_path))
+            with open(onnx_file_path, "rb") as model:
+                print("Beginning ONNX file parsing")
+                if not parser.parse(model.read(), path=onnx_file_path):
+                    print("ERROR: Failed to parse the ONNX file.")
+                    for error in range(parser.num_errors):
+                        print(parser.get_error(error))
+                    return None
+
+            print("Completed parsing of ONNX file")
+            print(
+                "Building an engine from file {}; this may take a while...".format(
+                    onnx_file_path
+                )
+            )
+
+            profile = builder.create_optimization_profile()
+            config.add_optimization_profile(profile)
+            config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS) # for the Fp32 constraints on LayerNorms
+
+            # high_precision_list = [
+            #     trt.LayerType.CONVOLUTION,
+            #     trt.LayerType.NORMALIZATION,
+            #     trt.LayerType.DECONVOLUTION,
+            # ]
+
+            layer_type_list = [
+                trt.LayerType.CONVOLUTION,
+                trt.LayerType.GRID_SAMPLE,
+                trt.LayerType.NMS,
+                trt.LayerType.ACTIVATION,
+                trt.LayerType.POOLING,
+                trt.LayerType.LRN,
+                trt.LayerType.SCALE,
+                trt.LayerType.SOFTMAX,
+                trt.LayerType.DECONVOLUTION,
+                trt.LayerType.CONCATENATION,
+                trt.LayerType.ELEMENTWISE,
+                trt.LayerType.PLUGIN,
+                trt.LayerType.UNARY,
+                trt.LayerType.PADDING,
+                trt.LayerType.SHUFFLE,
+                trt.LayerType.REDUCE,
+                trt.LayerType.TOPK,
+                trt.LayerType.GATHER,
+                trt.LayerType.MATRIX_MULTIPLY,
+                trt.LayerType.RAGGED_SOFTMAX,
+                trt.LayerType.CONSTANT,
+                trt.LayerType.IDENTITY,
+                trt.LayerType.CAST,
+                trt.LayerType.PLUGIN_V2,
+                trt.LayerType.SLICE,
+                trt.LayerType.SHAPE,
+                trt.LayerType.PARAMETRIC_RELU,
+                trt.LayerType.RESIZE,
+                trt.LayerType.TRIP_LIMIT,
+                trt.LayerType.RECURRENCE,
+                trt.LayerType.ITERATOR,
+                trt.LayerType.LOOP_OUTPUT,
+                trt.LayerType.SELECT,
+                trt.LayerType.ASSERTION,
+                trt.LayerType.FILL,
+                trt.LayerType.QUANTIZE,
+                trt.LayerType.DEQUANTIZE,
+                trt.LayerType.CONDITION,
+                trt.LayerType.CONDITIONAL_INPUT,
+                trt.LayerType.CONDITIONAL_OUTPUT,
+                trt.LayerType.SCATTER,
+                trt.LayerType.EINSUM,
+                trt.LayerType.ONE_HOT,
+                trt.LayerType.NON_ZERO,
+                trt.LayerType.REVERSE_SEQUENCE,
+                trt.LayerType.NORMALIZATION,
+                trt.LayerType.PLUGIN_V3,
+                trt.LayerType.SQUEEZE,
+                trt.LayerType.UNSQUEEZE,
+                trt.LayerType.CUMULATIVE,
+            ]
+
+
+
+            if trt_low_precision_override is not None:
+                print("Using TensorRT low precision override")
+                low_precision_list = trt_low_precision_override
+            else:
+                low_precision_list = layer_type_list
+
+            for i in range(network.num_layers):
+                layer = network.get_layer(i)
+
+                # i.e., it is some float layer
+                if (layer.precision == trt.float32) and (not (layer.type in low_precision_list)): #  and (layer.type != trt.LayerType.NORMALIZATION):
+                    layer.precision = trt.float32
+                    # layer.set_output_type(0, trt.float32)
+
+                    print(f"Set layer {i} to use FP32, which have type {layer.type}")
+
+            plan = builder.build_serialized_network(network, config)
+
+            if not plan:
+                print("ERROR: Failed to build the TensorRT engine.")
+                return None
+
+            engine = runtime.deserialize_cuda_engine(plan)
+            print("Completed creating Engine")
+            with open(engine_file_path, "wb") as f:
+                f.write(plan)
+
+            # save json description of the engine
+            inspector = engine.create_engine_inspector()
+            with open(engine_file_path.replace(".trt", ".json"), "w") as f:
+                f.write(inspector.get_engine_information(trt.LayerInformationFormat.JSON))
+
+            return engine
+
+    if (not force_rebuild) and os.path.exists(engine_file_path):
+        # If a serialized engine exists, use it instead of building an engine.
+        print("Reading engine from file {}".format(engine_file_path))
+        with open(engine_file_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
+            engine = runtime.deserialize_cuda_engine(f.read())
+    else:
+        engine = build_engine(trt_low_precision_override)
+
+    if engine is not None:
+        inspector = engine.create_engine_inspector()
+        json_content = inspector.get_engine_information(trt.LayerInformationFormat.JSON)
+
+        import json
+        formatted_json_content = json.dumps(json.loads(json_content), indent=4)
+        if not os.path.exists(engine_file_path.replace(".trt", ".json")):
+            with open(engine_file_path.replace(".trt", ".json"), "w") as f:
+                f.write(formatted_json_content)
+
+
+    return engine
 
 # dust3r data structure for reducing passing duplicate images through the encoder
 def is_symmetrized(gt1, gt2):
@@ -102,7 +270,8 @@ def modify_state_dict(original_state_dict, mappings):
 @dataclass
 class CachedEncoderFeatures:
     time_ns: int
-    img_L_ViT_features: torch.Tensor
+    img_L_mlp_ViT_features: torch.Tensor
+    img_L_final_ViT_features: torch.Tensor
     img_L_UNet_features: torch.Tensor
 
 class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
@@ -132,6 +301,7 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
         pretrained_checkpoint_path: Optional[str] = None,
         # Inference Settings
         inference_resolution: Optional[Tuple[int, int]] = (560, 420),  # WH
+        tensorrt_compile_cache_folder: Optional[str] = None,
         *args,
         **kwargs,
     ):
@@ -200,6 +370,7 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
 
         # MAC-VO special improvement
         self.feature_cache: Optional[CachedEncoderFeatures] = None
+        self.tensorrt_compile_cache_folder = tensorrt_compile_cache_folder
 
 
     @classmethod
@@ -623,49 +794,49 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
         """
         Interface for MAC-VO's pair data input. Will use time_ns as the key for caching encoder features for frames.
         """
+        # normalize the images
+        imgmean = IMAGE_NORMALIZATION_DICT["dinov2"].mean.view(1, 3, 1, 1).to(frame_t1_imgL.device)
+        imgstd = IMAGE_NORMALIZATION_DICT["dinov2"].std.view(1, 3, 1, 1).to(frame_t1_imgL.device)
+
+        frame_t1_imgL = (frame_t1_imgL - imgmean) / imgstd
+        frame_t2_imgL = (frame_t2_imgL - imgmean) / imgstd
+        frame_t2_imgR = (frame_t2_imgR - imgmean) / imgstd
 
         with torch.inference_mode():
             with torch.autocast("cuda", enabled=True, dtype=torch.float16):
-
-                # normalize the images
-                imgmean = IMAGE_NORMALIZATION_DICT["dinov2"].mean.view(1, 3, 1, 1).to(frame_t1_imgL.device)
-                imgstd = IMAGE_NORMALIZATION_DICT["dinov2"].std.view(1, 3, 1, 1).to(frame_t1_imgL.device)
-
-                frame_t1_imgL = (frame_t1_imgL - imgmean) / imgstd
-                frame_t2_imgL = (frame_t2_imgL - imgmean) / imgstd
-                frame_t2_imgR = (frame_t2_imgR - imgmean) / imgstd
-
                 if (self.feature_cache is not None) and self.feature_cache.time_ns == frame_t1_ns:
                     # cache hit, reuse 1/3 of encoder features.
-                    t1_imgL_feat = self.feature_cache.img_L_ViT_features
+                    t1_imgL_mlp_feat = self.feature_cache.img_L_mlp_ViT_features
+                    t1_imgL_final_feat = self.feature_cache.img_L_final_ViT_features
                     t1_imgL_UNet_feat = self.feature_cache.img_L_UNet_features
 
-                    t2_imgL_feat, t2_imgL_UNet_feat, flow_pred, cov_pred = self.inference_with_cached_features(
-                        frame_t2_imgL, frame_t2_imgR, t1_imgL_feat, t1_imgL_UNet_feat
+                    t2_imgL_mlp_feat, t2_imgL_final_feat, t2_imgL_UNet_feat, flow_pred, cov_pred = self.inference_with_cached_features(
+                        frame_t2_imgL, frame_t2_imgR, t1_imgL_mlp_feat, t1_imgL_final_feat, t1_imgL_UNet_feat
                     )
                 else:
                     # cache miss, re-compute all 3 encoder features. 
-                    t2_imgL_feat, t2_imgL_UNet_feat, flow_pred, cov_pred = self.inference_without_cache(
+                    t2_imgL_mlp_feat, t2_imgL_final_feat, t2_imgL_UNet_feat, flow_pred, cov_pred = self.inference_without_cache(
                         frame_t1_imgL, frame_t2_imgL, frame_t2_imgR
                     )
 
                 # store the features in the cache
                 self.feature_cache = CachedEncoderFeatures(
                     time_ns=frame_t2_ns,
-                    img_L_ViT_features=t2_imgL_feat,
+                    img_L_mlp_ViT_features=t2_imgL_mlp_feat,
+                    img_L_final_ViT_features=t2_imgL_final_feat,
                     img_L_UNet_features=t2_imgL_UNet_feat,
                 )
         
         return flow_pred, cov_pred
     
-    def inference_with_cached_features(self, frame_t2_imgL, frame_t2_imgR, t1_imgL_feat, t1_imgL_UNet_feat):
-        raise NotImplementedError("inference_with_cached_features is not implemented yet.")
+    # def inference_with_cached_features(self, frame_t2_imgL, frame_t2_imgR, t1_imgL_mlp_feat, t1_imgL_final_feat, t1_imgL_UNet_feat):
+    #     raise NotImplementedError("inference_with_cached_features is not implemented yet.")
 
-    def inference_without_cache(self, frame_t1_imgL, frame_t2_imgL, frame_t2_imgR):
-        """
-        Run inference without using cached features.
-        """
-        raise NotImplementedError("inference_without_cache is not implemented yet.")
+    # def inference_without_cache(self, frame_t1_imgL, frame_t2_imgL, frame_t2_imgR):
+    #     """
+    #     Run inference without using cached features.
+    #     """
+    #     raise NotImplementedError("inference_without_cache is not implemented yet.")
 
     def _downstream_head(self, head_num, decout, img_shape):
         "Run the respective prediction heads"
@@ -997,6 +1168,19 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
 
             self.detach_uncertainty_head = detach_uncertainty_head
 
+        # self.inference_with_cached_features = torch.compile(self.inference_with_cached_features)
+        # self.inference_without_cache = torch.compile(self.inference_without_cache)
+
+        self.without_cache_engine = None
+        self.with_cache_engine = None
+
+    def initialize_tensorrt(self, force_rebuild=False, trt_low_precision_override=None):
+        self.without_cache_engine, self.with_cache_engine = self.get_tensorrt_engines(force_rebuild=force_rebuild, trt_low_precision_override=trt_low_precision_override)
+        self.cuda_stream = torch.cuda.Stream()
+
+        self.context_without_cache = self.without_cache_engine.create_execution_context() if self.without_cache_engine else None
+        self.context_with_cache = self.with_cache_engine.create_execution_context() if self.with_cache_engine else None
+
     def forward(self, view1, view2) -> UFMOutputInterface:
         """
         Forward interface of correspondence prediction networks.
@@ -1169,58 +1353,239 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
     def _encode_images_with_UNet(self, img: torch.Tensor):
         return self.unet_feature(img)
 
-    def inference_with_cached_features(self, frame_t2_imgL, frame_t2_imgR, t1_imgL_feat, t1_imgL_UNet_feat):
+    def inference_with_cached_features(self, frame_t2_imgL, frame_t2_imgR, t1_imgL_mlp_feat, t1_imgL_final_feat, t1_imgL_UNet_feat):
         """
         Run inference without using cached features.
         """
-        cat_images = torch.cat([frame_t2_imgR, frame_t2_imgL], dim=0)
 
-        all_vit_feats = self._encode_images_with_vit(
-            img=cat_images,
-            data_norm_type="dinov2" # WARNING: Hard coded DINOv2 data norm type
-        )
+        if self.with_cache_engine is not None:
+            # inference using tensorRT
+            _, _, H, W = frame_t2_imgL.shape
 
-        refinement_mlp_feats, final_feats = all_vit_feats
+            flow_output = torch.zeros(2, 2, H, W, device=frame_t2_imgL.device)
+            cov_output = torch.zeros(2, 2, H, W, device=frame_t2_imgL.device)
 
-        # Run the UNet features
-        unet_features = self.unet_feature(cat_images)
+            if self.feature_cache is None:
+                self.feature_cache = CachedEncoderFeatures(
+                    img_L_mlp_ViT_features=torch.zeros(1, 1024, 30, 40, device=frame_t2_imgL.device),
+                    img_L_final_ViT_features=torch.zeros(1, 1024, 30, 40, device=frame_t2_imgL.device),
+                    img_L_UNet_features=torch.zeros(1, 16, 420, 560, device=frame_t2_imgL.device),
+                    time_ns=0 # dummy time, will be overwritten
+                )
+
+            torch_stream = torch.cuda.current_stream()
+            event = torch.cuda.Event()
+            torch_stream.record_event(event)
+
+            self.cuda_stream.wait_event(event)
+
+            # set inputs and output pointers
+            self.context_with_cache.set_tensor_address("frame_t2_imgL", frame_t2_imgL.data_ptr())
+            self.context_with_cache.set_tensor_address("frame_t2_imgR", frame_t2_imgR.data_ptr())
+            
+            self.context_with_cache.set_tensor_address("t1_imgL_mlp_feat", t1_imgL_mlp_feat.data_ptr())
+            self.context_with_cache.set_tensor_address("t1_imgL_final_feat", t1_imgL_final_feat.data_ptr())
+            self.context_with_cache.set_tensor_address("t1_imgL_UNet_feat", t1_imgL_UNet_feat.data_ptr())
+            
+            self.context_with_cache.set_tensor_address("t2_imgL_mlp_feat", self.feature_cache.img_L_mlp_ViT_features.data_ptr())
+            self.context_with_cache.set_tensor_address("t2_imgL_final_feat", self.feature_cache.img_L_final_ViT_features.data_ptr())
+            self.context_with_cache.set_tensor_address("t2_imgL_UNet_feat", self.feature_cache.img_L_UNet_features.data_ptr())
+            self.context_with_cache.set_tensor_address("flow_pred", flow_output.data_ptr())
+            self.context_with_cache.set_tensor_address("cov_pred", cov_output.data_ptr())
+
+            self.context_with_cache.execute_async_v3(stream_handle=self.cuda_stream.cuda_stream)
+            self.cuda_stream.synchronize()
+
+            return self.feature_cache.img_L_mlp_ViT_features, self.feature_cache.img_L_final_ViT_features, self.feature_cache.img_L_UNet_features, flow_output, cov_output
+        else:
+            cat_images = torch.cat([frame_t2_imgR, frame_t2_imgL], dim=0)
+
+            all_vit_feats = self._encode_images_with_vit(
+                img=cat_images,
+                data_norm_type="dinov2" # WARNING: Hard coded DINOv2 data norm type
+            )
+
+            refinement_mlp_feats, final_feats = all_vit_feats
+
+            # Run the UNet features
+            unet_features = self.unet_feature(cat_images)
+            
+            ordered_mlp_feats = [torch.cat([refinement_mlp_feats[1:2], t1_imgL_mlp_feat], dim=0), refinement_mlp_feats] # t2L, t1L compare to t2R, t2L
+            ordered_final_feats = [torch.cat([final_feats[1:2], t1_imgL_final_feat], dim=0), final_feats]
+            ordered_unet_feats = [torch.cat([unet_features[1:2], t1_imgL_UNet_feat], dim=0), unet_features]
+
+            return self.inference_with_encoded_feats(
+                ordered_mlp_feats=ordered_mlp_feats,
+                ordered_final_feats=ordered_final_feats,
+                ordered_unet_feats=ordered_unet_feats
+            )
+
+    def export_onnx(self, output_path = None, resolution_hw=None):
+        """
+            Export the two main functions, inference_without_cache and inference_with_cached_features, to ONNX format for further tensorRT optimization. 
+        """
+
+        if resolution_hw is None:
+            resolution_hw = self.inference_resolution[::-1]  # WH to HW
         
-        ordered_mlp_feats = [torch.cat([refinement_mlp_feats[1:2], t1_imgL_feat[0]], dim=0), refinement_mlp_feats] # t2L, t1L compare to t2R, t2L
-        ordered_final_feats = [torch.cat([final_feats[1:2], t1_imgL_feat[1]], dim=0), final_feats]
-        ordered_unet_feats = [torch.cat([unet_features[1:2], t1_imgL_UNet_feat], dim=0), unet_features]
+        if output_path is None:
+            output_path = self.tensorrt_compile_cache_folder
 
-        return self.inference_with_encoded_feats(
-            ordered_mlp_feats=ordered_mlp_feats,
-            ordered_final_feats=ordered_final_feats,
-            ordered_unet_feats=ordered_unet_feats
+        class ONNXWithoutCacheWrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+            
+            def forward(self, *args):
+                return self.model.inference_without_cache(*args)
+
+        class ONNXWithCacheWrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(self, *args):
+                return self.model.inference_with_cached_features(*args)
+
+        if not os.path.exists(output_path, f"ufm_without_cache_{resolution_hw[0]}x{resolution_hw[1]}.onnx"):
+            # export ONNX for both wrappers
+            example_inputs = (
+                torch.randn(1, 3, *resolution_hw).cuda(),  # frame_t1_imgL
+                torch.randn(1, 3, *resolution_hw).cuda(),  # frame_t2_imgL
+                torch.randn(1, 3, *resolution_hw).cuda(),  # frame_t2_imgR
+            )
+
+            without_cache_model = torch.onnx.export(
+                ONNXWithoutCacheWrapper(self).eval(),
+                input_names=("frame_t1_imgL", "frame_t2_imgL", "frame_t2_imgR"),
+                output_names=("t2_imgL_mlp_feat", "t2_imgL_final_feat", "t2_imgL_UNet_feat", "flow_pred", "cov_pred"),
+                args=example_inputs,
+                dynamo=True,
+                external_data=True,
+                optimize=True
+            )
+
+            without_cache_model.save(os.path.join(output_path, f"ufm_without_cache_{resolution_hw[0]}x{resolution_hw[1]}.onnx"))
+
+        example_inputs2 = (
+           torch.randn(1, 3, *resolution_hw).cuda(),  # frame_t2_imgL
+           torch.randn(1, 3, *resolution_hw).cuda(),  # frame_t2_imgR
+           torch.randn(1, 1024, resolution_hw[0] // 14, resolution_hw[1] // 14).cuda(), torch.randn(1, 1024, resolution_hw[0] // 14, resolution_hw[1] // 14).cuda(),  # cached features
+           torch.randn(1, 16, *resolution_hw).cuda()
         )
+
+        with_cache_model = torch.onnx.export(
+            ONNXWithCacheWrapper(self).eval(),
+            input_names=("frame_t2_imgL", "frame_t2_imgR", "t1_imgL_mlp_feat", "t1_imgL_final_feat", "t1_imgL_UNet_feat"),
+            output_names=("t2_imgL_mlp_feat", "t2_imgL_final_feat", "t2_imgL_UNet_feat", "flow_pred", "cov_pred"),
+            args=example_inputs2,
+            dynamo=True,
+            external_data=True,
+            optimize=True
+        )
+
+        with_cache_model.save(os.path.join(output_path, f"ufm_with_cache_{resolution_hw[0]}x{resolution_hw[1]}.onnx"))
+
+    def get_tensorrt_engines(self, cache_folder = None, force_rebuild=False, trt_low_precision_override=None, resolution_hw=None):
+
+        if resolution_hw is None:
+            resolution_hw = self.inference_resolution[::-1]  # WH to HW
+
+        if cache_folder is None:
+            cache_folder = self.tensorrt_compile_cache_folder
+
+        without_cache_onnx_path = os.path.join(cache_folder, f"ufm_without_cache_{resolution_hw[0]}x{resolution_hw[1]}.onnx")
+        with_cache_onnx_path = os.path.join(cache_folder, f"ufm_with_cache_{resolution_hw[0]}x{resolution_hw[1]}.onnx")
+
+        # if not os.path.exists(without_cache_onnx_path) or not os.path.exists(with_cache_onnx_path):
+        #     print("ONNX not found, exporting...")
+        #     self.export_onnx(output_path=cache_folder)
+
+        # assert os.path.exists(without_cache_onnx_path), "ONNX model for UFM without cache not found."
+        # assert os.path.exists(with_cache_onnx_path), "ONNX model for UFM with cache not found."
+
+        without_cache_engine = get_engine(
+            onnx_file_path=without_cache_onnx_path,
+            engine_file_path=os.path.join(cache_folder, f"ufm_without_cache_{resolution_hw[0]}x{resolution_hw[1]}.trt"),
+            force_rebuild=force_rebuild,
+            trt_low_precision_override=trt_low_precision_override
+        )
+        # assert without_cache_engine is not None, "Failed to compile UFM without cache ONNX model to TensorRT engine."
+
+        with_cache_engine = get_engine(
+            onnx_file_path=with_cache_onnx_path,
+            engine_file_path=os.path.join(cache_folder, f"ufm_with_cache_{resolution_hw[0]}x{resolution_hw[1]}.trt"),
+            force_rebuild=force_rebuild,
+            trt_low_precision_override=trt_low_precision_override
+        )
+        # assert with_cache_engine is not None, "Failed to compile UFM with cache ONNX model to TensorRT engine."
+
+        return without_cache_engine, with_cache_engine
 
     def inference_without_cache(self, frame_t1_imgL, frame_t2_imgL, frame_t2_imgR):
         """
         Run inference without using cached features.
         """
 
-        cat_images = torch.cat([frame_t2_imgR, frame_t2_imgL, frame_t1_imgL], dim=0)
+        if self.without_cache_engine is not None:
+            print("Using TensorRT")
+            # inference using tensorRT
+            _, _, H, W = frame_t1_imgL.shape
 
-        all_vit_feats = self._encode_images_with_vit(
-            img=cat_images,
-            data_norm_type="dinov2" # WARNING: Hard coded DINOv2 data norm type
-        )
+            flow_output = torch.zeros(2, 2, H, W, device=frame_t1_imgL.device)
+            cov_output = torch.zeros(2, 2, H, W, device=frame_t1_imgL.device)
 
-        refinement_mlp_feats, final_feats = all_vit_feats
+            if self.feature_cache is None:
+                self.feature_cache = CachedEncoderFeatures(
+                    img_L_mlp_ViT_features=torch.zeros(1, 1024, 30, 40, device=frame_t1_imgL.device),
+                    img_L_final_ViT_features=torch.zeros(1, 1024, 30, 40, device=frame_t1_imgL.device),
+                    img_L_UNet_features=torch.zeros(1, 16, 420, 560, device=frame_t1_imgL.device),
+                    time_ns=0
+                )
 
-        # Run the UNet features
-        unet_features = self.unet_feature(cat_images)
-        
-        ordered_mlp_feats = [refinement_mlp_feats[1:], refinement_mlp_feats[:2]] # t2L, t1L compare to t2R, t2L
-        ordered_final_feats = [final_feats[1:], final_feats[:2]]
-        ordered_unet_feats = [unet_features[1:], unet_features[:2]]
+            # torch.cuda.synchronize() # Very important!!!! this makes sure all data are available before the kernel, on a different cuda stream, starting!
+            torch_stream = torch.cuda.current_stream()
+            event = torch.cuda.Event()
+            torch_stream.record_event(event)
 
-        return self.inference_with_encoded_feats(
-            ordered_mlp_feats=ordered_mlp_feats,
-            ordered_final_feats=ordered_final_feats,
-            ordered_unet_feats=ordered_unet_feats
-        )
+            self.cuda_stream.wait_event(event)
+
+            # set inputs and output pointers
+            self.context_without_cache.set_tensor_address("frame_t1_imgL", frame_t1_imgL.data_ptr())
+            self.context_without_cache.set_tensor_address("frame_t2_imgL", frame_t2_imgL.data_ptr())
+            self.context_without_cache.set_tensor_address("frame_t2_imgR", frame_t2_imgR.data_ptr())
+            self.context_without_cache.set_tensor_address("t2_imgL_mlp_feat", self.feature_cache.img_L_mlp_ViT_features.data_ptr())
+            self.context_without_cache.set_tensor_address("t2_imgL_final_feat", self.feature_cache.img_L_final_ViT_features.data_ptr())
+            self.context_without_cache.set_tensor_address("t2_imgL_UNet_feat", self.feature_cache.img_L_UNet_features.data_ptr())
+            self.context_without_cache.set_tensor_address("flow_pred", flow_output.data_ptr())
+            self.context_without_cache.set_tensor_address("cov_pred", cov_output.data_ptr())
+
+            self.context_without_cache.execute_async_v3(stream_handle=self.cuda_stream.cuda_stream)
+            self.cuda_stream.synchronize()
+
+            return self.feature_cache.img_L_mlp_ViT_features, self.feature_cache.img_L_final_ViT_features, self.feature_cache.img_L_UNet_features, flow_output, cov_output
+        else:
+            cat_images = torch.cat([frame_t2_imgR, frame_t2_imgL, frame_t1_imgL], dim=0)
+
+            all_vit_feats = self._encode_images_with_vit(
+                img=cat_images,
+                data_norm_type="dinov2" # WARNING: Hard coded DINOv2 data norm type
+            )
+
+            refinement_mlp_feats, final_feats = all_vit_feats
+
+            # Run the UNet features
+            unet_features = self.unet_feature(cat_images)
+            
+            ordered_mlp_feats = [refinement_mlp_feats[1:], refinement_mlp_feats[:2]] # t2L, t1L compare to t2R, t2L
+            ordered_final_feats = [final_feats[1:], final_feats[:2]]
+            ordered_unet_feats = [unet_features[1:], unet_features[:2]]
+
+            return self.inference_with_encoded_feats(
+                ordered_mlp_feats=ordered_mlp_feats,
+                ordered_final_feats=ordered_final_feats,
+                ordered_unet_feats=ordered_unet_feats
+            )
 
     def inference_with_encoded_feats(self, ordered_mlp_feats, ordered_final_feats, ordered_unet_feats):
 
@@ -1324,7 +1689,7 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
 
         t2_imgL_UNet_feat = ordered_unet_feats[0][0:1]  # t2L UNet feature
 
-        return t2_imgL_feat, t2_imgL_UNet_feat, result.flow.flow_output, 1.0 / (1e-2 + result.covisibility.mask[:, :1, ...].repeat(1, 2, 1, 1))
+        return t2_imgL_feat[0], t2_imgL_feat[1], t2_imgL_UNet_feat, result.flow.flow_output, 1.0 / (1e-2 + result.covisibility.mask[:, :1, ...].repeat(1, 2, 1, 1))
 
     # @torch.compile()
     def classification_refinement(self, flow_prediction, classification_features) -> Dict[str, Any]:
