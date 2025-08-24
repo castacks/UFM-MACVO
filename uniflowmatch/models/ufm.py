@@ -186,7 +186,7 @@ def get_engine(onnx_file_path, engine_file_path="", force_rebuild=False, trt_low
 
             # save json description of the engine
             inspector = engine.create_engine_inspector()
-            with open(engine_file_path.replace(".trt", ".json"), "w") as f:
+            with open(engine_file_path.replace(".trt", ".trt.json"), "w") as f:
                 f.write(inspector.get_engine_information(trt.LayerInformationFormat.JSON))
 
             return engine
@@ -206,7 +206,7 @@ def get_engine(onnx_file_path, engine_file_path="", force_rebuild=False, trt_low
         import json
         formatted_json_content = json.dumps(json.loads(json_content), indent=4)
         if not os.path.exists(engine_file_path.replace(".trt", ".json")):
-            with open(engine_file_path.replace(".trt", ".json"), "w") as f:
+            with open(engine_file_path.replace(".trt", ".trt.json"), "w") as f:
                 f.write(formatted_json_content)
 
 
@@ -372,6 +372,7 @@ class UniFlowMatch(UniFlowMatchModelsBase, PyTorchModelHubMixin):
         self.feature_cache: Optional[CachedEncoderFeatures] = None
         self.tensorrt_compile_cache_folder = tensorrt_compile_cache_folder
 
+        os.makedirs(self.tensorrt_compile_cache_folder, exist_ok=True)
 
     @classmethod
     def from_pretrained_ckpt(cls, pretrained_model_name_or_path, strict=True, **kw):
@@ -1174,6 +1175,9 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
         self.without_cache_engine = None
         self.with_cache_engine = None
 
+        assert len(self.inference_resolution) == 1
+        self.inference_resolution = self.inference_resolution[0]
+
     def initialize_tensorrt(self, force_rebuild=False, trt_low_precision_override=None):
         self.without_cache_engine, self.with_cache_engine = self.get_tensorrt_engines(force_rebuild=force_rebuild, trt_low_precision_override=trt_low_precision_override)
         self.cuda_stream = torch.cuda.Stream()
@@ -1361,15 +1365,17 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
         if self.with_cache_engine is not None:
             # inference using tensorRT
             _, _, H, W = frame_t2_imgL.shape
+            assert H == self.inference_resolution[1] and W == self.inference_resolution[0], f"Input resolution {W}x{H} does not match the compiled engine resolution {self.inference_resolution[0]}x{self.inference_resolution[1]}"
 
             flow_output = torch.zeros(2, 2, H, W, device=frame_t2_imgL.device)
             cov_output = torch.zeros(2, 2, H, W, device=frame_t2_imgL.device)
 
             if self.feature_cache is None:
+
                 self.feature_cache = CachedEncoderFeatures(
-                    img_L_mlp_ViT_features=torch.zeros(1, 1024, 30, 40, device=frame_t2_imgL.device),
-                    img_L_final_ViT_features=torch.zeros(1, 1024, 30, 40, device=frame_t2_imgL.device),
-                    img_L_UNet_features=torch.zeros(1, 16, 420, 560, device=frame_t2_imgL.device),
+                    img_L_mlp_ViT_features=torch.zeros(1, 1024, H // 14, W // 14, device=frame_t2_imgL.device),
+                    img_L_final_ViT_features=torch.zeros(1, 1024, H // 14, W // 14, device=frame_t2_imgL.device),
+                    img_L_UNet_features=torch.zeros(1, 16, H, W, device=frame_t2_imgL.device),
                     time_ns=0 # dummy time, will be overwritten
                 )
 
@@ -1419,6 +1425,7 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
                 ordered_final_feats=ordered_final_feats,
                 ordered_unet_feats=ordered_unet_feats
             )
+        
 
     def export_onnx(self, output_path = None, resolution_hw=None):
         """
@@ -1447,7 +1454,7 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
             def forward(self, *args):
                 return self.model.inference_with_cached_features(*args)
 
-        if not os.path.exists(output_path, f"ufm_without_cache_{resolution_hw[0]}x{resolution_hw[1]}.onnx"):
+        if not os.path.exists(os.path.join(output_path, f"ufm_without_cache_{resolution_hw[0]}x{resolution_hw[1]}.onnx")):
             # export ONNX for both wrappers
             example_inputs = (
                 torch.randn(1, 3, *resolution_hw).cuda(),  # frame_t1_imgL
@@ -1497,12 +1504,12 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
         without_cache_onnx_path = os.path.join(cache_folder, f"ufm_without_cache_{resolution_hw[0]}x{resolution_hw[1]}.onnx")
         with_cache_onnx_path = os.path.join(cache_folder, f"ufm_with_cache_{resolution_hw[0]}x{resolution_hw[1]}.onnx")
 
-        # if not os.path.exists(without_cache_onnx_path) or not os.path.exists(with_cache_onnx_path):
-        #     print("ONNX not found, exporting...")
-        #     self.export_onnx(output_path=cache_folder)
+        if not os.path.exists(without_cache_onnx_path) or not os.path.exists(with_cache_onnx_path):
+            print("ONNX not found, exporting...")
+            self.export_onnx(output_path=cache_folder)
 
-        # assert os.path.exists(without_cache_onnx_path), "ONNX model for UFM without cache not found."
-        # assert os.path.exists(with_cache_onnx_path), "ONNX model for UFM with cache not found."
+        assert os.path.exists(without_cache_onnx_path), "ONNX model for UFM without cache not found."
+        assert os.path.exists(with_cache_onnx_path), "ONNX model for UFM with cache not found."
 
         without_cache_engine = get_engine(
             onnx_file_path=without_cache_onnx_path,
@@ -1535,11 +1542,13 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
             flow_output = torch.zeros(2, 2, H, W, device=frame_t1_imgL.device)
             cov_output = torch.zeros(2, 2, H, W, device=frame_t1_imgL.device)
 
+            assert H == self.inference_resolution[1] and W == self.inference_resolution[0], f"Input resolution {W}x{H} does not match the compiled engine resolution {self.inference_resolution[0]}x{self.inference_resolution[1]}"
+
             if self.feature_cache is None:
                 self.feature_cache = CachedEncoderFeatures(
-                    img_L_mlp_ViT_features=torch.zeros(1, 1024, 30, 40, device=frame_t1_imgL.device),
-                    img_L_final_ViT_features=torch.zeros(1, 1024, 30, 40, device=frame_t1_imgL.device),
-                    img_L_UNet_features=torch.zeros(1, 16, 420, 560, device=frame_t1_imgL.device),
+                    img_L_mlp_ViT_features=torch.zeros(1, 1024, H // 14, W // 14, device=frame_t1_imgL.device),
+                    img_L_final_ViT_features=torch.zeros(1, 1024, H // 14, W // 14, device=frame_t1_imgL.device),
+                    img_L_UNet_features=torch.zeros(1, 16, H, W, device=frame_t1_imgL.device),
                     time_ns=0
                 )
 
