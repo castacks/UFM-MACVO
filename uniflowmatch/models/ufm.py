@@ -1096,6 +1096,7 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
         # Classification Heads & Adaptors
         temperature: float = 4,
         use_unet_feature: bool = False,
+        use_unet_batchnorm: bool = False,
         classification_head_type: str = "patch_mlp",
         classification_head_kwargs: Dict[str, Any] = {},
         feature_combine_method: str = "conv",
@@ -1144,7 +1145,8 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
 
         # Unet experiment
         if self.use_unet_feature:
-            self.unet_feature = UNet(in_channels=3, out_channels=16, features=[64, 128, 256, 512])
+            self.use_unet_batchnorm = use_unet_batchnorm
+            self.unet_feature = UNet(in_channels=3, out_channels=16, features=[64, 128, 256, 512], use_batch_norm=self.use_unet_batchnorm)
 
             self.conv1 = nn.Conv2d(32, 32, kernel_size=1, stride=1, padding=0)
 
@@ -1892,7 +1894,10 @@ if __name__ == "__main__":
 
     USE_REFINEMENT_MODEL = False
 
-    model = UniFlowMatch.from_pretrained("infinity1096/UFM-Robotics-V0", token="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", inference_resolution=[(480, 320)])
+    # model = UniFlowMatchClassificationRefinement.from_pretrained_ckpt("/home/inf/match_anything/checkpoints/uniflowmatch/refinement/ufm_refine_252_336.ckpt", tensorrt_compile_cache_folder="/home/inf/UFM-MACVO/cache") 
+    
+    import pdb; pdb.set_trace()
+    
     model.to("cuda")
     model.eval()
 
