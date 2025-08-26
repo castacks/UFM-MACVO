@@ -1311,7 +1311,7 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
                 classification_features = self.classification_head(classification_input).decoded_channels
 
                 if self.use_unet_feature:
-
+                    self.feature_combine_method = "modulate"
                     if self.feature_combine_method == "conv":
                         combined_features = torch.cat(
                             [classification_features, torch.cat([unet_feat1, unet_feat2], dim=0)], dim=1
@@ -1675,14 +1675,22 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
 
         classification_features = self.classification_head(classification_input).decoded_channels
 
+        if self.feature_combine_method == "conv":
+            combined_features = torch.cat(
+                [classification_features, torch.cat([ordered_unet_feats[0], ordered_unet_feats[1]], dim=0)], dim=1
+            )
 
-        combined_features = torch.cat(
-            [classification_features, torch.cat([ordered_unet_feats[0], ordered_unet_feats[1]], dim=0)], dim=1
-        )
+            combined_features = self.conv1(combined_features)
+            combined_features = nn.functional.relu(combined_features)
+            combined_features = self.conv2(combined_features)
+        elif self.feature_combine_method == "modulate":
 
-        combined_features = self.conv1(combined_features)
-        combined_features = nn.functional.relu(combined_features)
-        classification_features = self.conv2(combined_features)
+            combined_features = classification_features * torch.tanh(
+                torch.cat([ordered_unet_feats[0], ordered_unet_feats[1]], dim=0)
+            )
+            combined_features = self.conv2(combined_features)
+
+        classification_features = combined_features
 
         # apply classification refinement
         residual, log_softmax_attention = self.classification_refinement(
