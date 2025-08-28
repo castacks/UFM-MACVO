@@ -45,10 +45,10 @@ import tensorrt as trt
 
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
-def get_engine(onnx_file_path, engine_file_path="", force_rebuild=False, trt_low_precision_override=None):
+def get_engine(onnx_file_path, engine_file_path="", force_rebuild=False, trt_low_precision_override=None, name_to_precision=None):
     """Attempts to load a serialized engine if available, otherwise builds a new TensorRT engine and saves it."""
 
-    def build_engine(trt_low_precision_override=None):
+    def build_engine(trt_low_precision_override=None, name_to_precision=None):
         """Takes an ONNX file and creates a TensorRT engine to run inference with"""
         with trt.Builder(TRT_LOGGER) as builder, builder.create_network(
             0
@@ -155,7 +155,8 @@ def get_engine(onnx_file_path, engine_file_path="", force_rebuild=False, trt_low
                 trt.LayerType.CUMULATIVE,
             ]
 
-
+            if name_to_precision == "default":
+                name_to_precision = get_default_cached_precision_mapping()
 
             if trt_low_precision_override is not None:
                 print("Using TensorRT low precision override")
@@ -166,12 +167,17 @@ def get_engine(onnx_file_path, engine_file_path="", force_rebuild=False, trt_low
             for i in range(network.num_layers):
                 layer = network.get_layer(i)
 
+                if name_to_precision is not None:
+                    if name_to_precision(layer.name) == "FP16":
+                        # print("Skipped for FP16", layer.name, "from naming")
+                        continue
+
                 # i.e., it is some float layer
                 if (layer.precision == trt.float32) and (not (layer.type in low_precision_list)): #  and (layer.type != trt.LayerType.NORMALIZATION):
                     layer.precision = trt.float32
                     # layer.set_output_type(0, trt.float32)
 
-                    print(f"Set layer {i} to use FP32, which have type {layer.type}")
+                    print(f"Set layer {i}:{layer.name} to use FP32, which have type {layer.type}")
 
             plan = builder.build_serialized_network(network, config)
 
@@ -197,7 +203,7 @@ def get_engine(onnx_file_path, engine_file_path="", force_rebuild=False, trt_low
         with open(engine_file_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
             engine = runtime.deserialize_cuda_engine(f.read())
     else:
-        engine = build_engine(trt_low_precision_override)
+        engine = build_engine(trt_low_precision_override, name_to_precision)
 
     if engine is not None:
         inspector = engine.create_engine_inspector()
@@ -266,6 +272,44 @@ def modify_state_dict(original_state_dict, mappings):
         new_state_dict[new_key if new_key is not None else k] = v
 
     return new_state_dict
+
+def get_default_cached_precision_mapping():
+    def in_range(x, name_class, min, max):
+            if name_class + "_" in x:
+                idx = int(x.replace(name_class + "_", ""))
+            elif name_class == x:
+                idx = 0
+            else:
+                return False
+            return idx >= min and idx <= max
+
+    is_rn50_layers = lambda x: in_range(x, "node_conv2d", 0, 19) | in_range(x, "node_relu", 0, 17) | in_range(x, "n0", 97, 105) | in_range(x, "node_convolution", 0, 3)
+    dinov2_layer_norms = lambda x: in_range(x, "node_layer_norm", 0, 48)
+    global_transformer_layer_norms = lambda x: in_range(x, "node_layer_norm", 49, 76)
+    shapes = lambda x: in_range(x, "ONNXTRT_ShapeElementWise", 0, 999999)
+    element_wise_mul = lambda x: in_range(x, "node_mul", 0, 999999)
+    element_wise_add = lambda x: in_range(x, "node_add", 0, 999999)
+    element_wise_sub = lambda x: in_range(x, "node_sub", 0, 999999)
+    
+
+    linear = lambda x: in_range(x, "node_linear", 0, 999999)
+    element_wise_add2 = lambda x: in_range(x, "node_Add", 0, 999999)
+    gelu = lambda x: in_range(x, "node_gelu", 0, 999999)
+    
+    # DPT heads
+    covariance_head_convs = lambda x: in_range(x, "node_conv2d", 50, 77) # 78 - 79 needs FP32 precision
+    covariance_head_deconvs = lambda x: in_range(x, "node_convolution", 6, 7) #
+
+    flow_head_convs = lambda x: in_range(x, "node_conv2d", 20, 49)
+    flow_head_deconvs = lambda x: in_range(x, "node_convolution", 4, 5)
+
+    refinement_convs = lambda x: in_range(x, "node_conv2d", 80, 81) # Layer 78 need high precision for some reason
+
+    def name_to_precision(name):
+        if is_rn50_layers(name) or dinov2_layer_norms(name) or global_transformer_layer_norms(name) or shapes(name) or element_wise_mul(name) or element_wise_add(name) or element_wise_add2(name) or element_wise_sub(name) or gelu(name) or linear(name) or covariance_head_convs(name) or covariance_head_deconvs(name) or flow_head_convs(name) or flow_head_deconvs(name) or refinement_convs(name):
+            return "FP16"
+
+    return name_to_precision
 
 @dataclass
 class CachedEncoderFeatures:
@@ -1516,8 +1560,9 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
         without_cache_engine = get_engine(
             onnx_file_path=without_cache_onnx_path,
             engine_file_path=os.path.join(cache_folder, f"ufm_without_cache_{resolution_hw[0]}x{resolution_hw[1]}.trt"),
-            force_rebuild=force_rebuild,
-            trt_low_precision_override=trt_low_precision_override
+            force_rebuild=False,
+            trt_low_precision_override=trt_low_precision_override,
+            name_to_precision=None
         )
         # assert without_cache_engine is not None, "Failed to compile UFM without cache ONNX model to TensorRT engine."
 
@@ -1525,7 +1570,8 @@ class UniFlowMatchClassificationRefinement(UniFlowMatch, PyTorchModelHubMixin):
             onnx_file_path=with_cache_onnx_path,
             engine_file_path=os.path.join(cache_folder, f"ufm_with_cache_{resolution_hw[0]}x{resolution_hw[1]}.trt"),
             force_rebuild=force_rebuild,
-            trt_low_precision_override=trt_low_precision_override
+            trt_low_precision_override=trt_low_precision_override,
+            name_to_precision="default"
         )
         # assert with_cache_engine is not None, "Failed to compile UFM with cache ONNX model to TensorRT engine."
 
